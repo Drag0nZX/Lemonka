@@ -2,6 +2,7 @@
 import logging
 import json
 import os
+import random
 import time
 import warnings
 import sys
@@ -31,6 +32,13 @@ TOKEN = '8279641876:AAGJOGqD8KQweoxq-k410T3r_wwhLQHEzlM'
 OWNER_ID = 5543009095
 ADMIN_GROUP_ID = -1002359235574
 REPORT_TOPIC_ID = 21971
+SUMMARY_TELEGRAM_CHAT_IDS = {2403528036}
+ADMIN_IDS: set[int] = {
+    OWNER_ID,
+    6248897312,
+    295735470,
+    587927728
+}
 
 DISCORD_LINK = "https://discord.gg/lemoncraft"
 DONATE_LINK  = "https://donate.lemoncraft.su/"
@@ -48,6 +56,8 @@ NICKNAMES_FILE = Path("nicknames.json")
 LINKED_ACCOUNTS_FILE = Path("linked_accounts.json")
 LINK_CODES_FILE = Path("link_codes.json")
 CHAT_MEMORY_FILE = Path("chat_memory.json")
+DIALOGUE_STYLE_FILE = Path("dialogue_style.json")
+RELOAD_NOTICE_FILE = Path("reload_notice.json")
 KNOWLEDGE_FACTS: dict[str, str] = {}
 PLAYERS_DATA: dict[str, Any] = {}
 NICKNAMES_DATA: dict[str, str] = {}
@@ -60,6 +70,8 @@ ticket_index: dict[str, list[str]] = {}
 linked_accounts: dict[int, str] = {}
 pending_link_codes: dict[str, dict[str, Any]] = {}
 chat_memory: list[dict[str, Any]] = []
+dialogue_style: dict[str, dict[str, Any]] = {}
+reload_notice: dict[str, Any] = {}
 knowledge_cache: dict[str, Any] = {}
 fact_embeddings = None
 fact_keys: list[str] = []
@@ -272,10 +284,611 @@ def save_chat_memory() -> None:
         logger.error(f"Ошибка сохранения chat memory: {e}")
 
 
-def _remember_chat_message(source: str, room: str, speaker: str, text: str) -> None:
+def load_dialogue_style() -> None:
+    global dialogue_style
+    data = load_json(DIALOGUE_STYLE_FILE, {})
+    if not isinstance(data, dict):
+        dialogue_style = {}
+        return
+
+    cleaned: dict[str, dict[str, Any]] = {}
+    for actor_key, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        cleaned[str(actor_key)] = {
+            "messages": int(info.get("messages") or 0),
+            "casual": int(info.get("casual") or 0),
+            "technical": int(info.get("technical") or 0),
+            "warm": int(info.get("warm") or 0),
+            "last": [normalize_text(item) for item in (info.get("last") or []) if normalize_text(item)],
+        }
+    dialogue_style = cleaned
+
+
+def save_dialogue_style() -> None:
+    try:
+        with open(DIALOGUE_STYLE_FILE, "w", encoding="utf-8") as f:
+            json.dump(dialogue_style, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения dialogue style: {e}")
+
+
+def load_reload_notice() -> None:
+    global reload_notice
+    data = load_json(RELOAD_NOTICE_FILE, {})
+    reload_notice = data if isinstance(data, dict) else {}
+
+
+def save_reload_notice() -> None:
+    try:
+        with open(RELOAD_NOTICE_FILE, "w", encoding="utf-8") as f:
+            json.dump(reload_notice, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения reload notice: {e}")
+
+
+def clear_reload_notice() -> None:
+    global reload_notice
+    reload_notice = {}
+    try:
+        if RELOAD_NOTICE_FILE.exists():
+            RELOAD_NOTICE_FILE.unlink()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить reload notice: {e}")
+
+
+def _ensure_dialogue_style(actor_key: str) -> dict[str, Any]:
+    actor_key = normalize_actor_key(actor_key)
+    if not actor_key:
+        return {}
+    bucket = dialogue_style.setdefault(actor_key, {
+        "messages": 0,
+        "casual": 0,
+        "technical": 0,
+        "warm": 0,
+        "last": [],
+    })
+    bucket.setdefault("messages", 0)
+    bucket.setdefault("casual", 0)
+    bucket.setdefault("technical", 0)
+    bucket.setdefault("warm", 0)
+    bucket.setdefault("last", [])
+    return bucket
+
+
+def learn_dialogue_style(actor_key: str, text: str) -> None:
+    actor_key = normalize_actor_key(actor_key)
+    text = normalize_text(text)
+    if not actor_key or not text:
+        return
+
+    lower = text.lower()
+    bucket = _ensure_dialogue_style(actor_key)
+    if not bucket:
+        return
+
+    bucket["messages"] = int(bucket.get("messages", 0)) + 1
+
+    casual_markers = (
+        "привет", "ку", "хай", "hello", "hi", "спасибо", "спс", "пж", "пожалуй",
+        "как дела", "как ты", "что делаешь", "чем занят", "пока", "доброе утро",
+        "добрый день", "добрый вечер", "ладно", "угу", "ага", "ок", "окей"
+    )
+    technical_markers = (
+        "команда", "ошибка", "краш", "лаг", "инстанс", "клиент", "сервер", "uuid",
+        "тикет", "репорт", "лог", "конфиг", "mod", "мод", "api", "prompt", "промпт"
+    )
+    warm_markers = ("❤️", "♡", "💕", "💛", "💜", "😘", "мила", "солн", "котик", "зайк", "мой хороший")
+
+    if any(marker in lower for marker in casual_markers):
+        bucket["casual"] = int(bucket.get("casual", 0)) + 1
+    if any(marker in lower for marker in technical_markers):
+        bucket["technical"] = int(bucket.get("technical", 0)) + 1
+    if any(marker in lower for marker in warm_markers):
+        bucket["warm"] = int(bucket.get("warm", 0)) + 1
+
+    last_items = bucket.setdefault("last", [])
+    last_items.append(text)
+    if len(last_items) > 16:
+        del last_items[:-16]
+
+    save_dialogue_style()
+
+
+def get_dialogue_style_profile(actor_key: str) -> dict[str, Any]:
+    actor_key = normalize_actor_key(actor_key)
+    if not actor_key:
+        return {"mode": "neutral", "warm": 0, "casual": 0, "technical": 0}
+
+    bucket = dialogue_style.get(actor_key) or {}
+    casual = int(bucket.get("casual", 0) or 0)
+    technical = int(bucket.get("technical", 0) or 0)
+    warm = int(bucket.get("warm", 0) or 0)
+
+    mode = "neutral"
+    if casual > technical:
+        mode = "casual"
+    elif technical > casual:
+        mode = "technical"
+
+    return {
+        "mode": mode,
+        "warm": warm,
+        "casual": casual,
+        "technical": technical,
+    }
+
+
+async def is_admin_user(message: Message) -> bool:
+    if not message.from_user:
+        return False
+
+    if message.from_user.id in ADMIN_IDS or message.from_user.id == OWNER_ID:
+        return True
+
+    try:
+        member = await bot.get_chat_member(ADMIN_GROUP_ID, message.from_user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def humanize_lemonka_reply(answer: str, actor_key: str, user_text: str = "") -> str:
+    answer = normalize_text(answer)
+    if not answer:
+        return answer
+
+    profile = get_dialogue_style_profile(actor_key)
+    lower = answer.lower()
+
+    opener_replacements = [
+        ("конечно,", "ага,"),
+        ("конечно!", "ага!"),
+        ("да,", "угу,"),
+        ("да!", "угу!"),
+        ("нет,", "не-а,"),
+        ("нет!", "не-а!"),
+        ("хм,", "мм,"),
+        ("хмм,", "мм,"),
+        ("вот,", "смотри,"),
+        ("вот что", "смотри, что"),
+    ]
+    for old, new in opener_replacements:
+        if lower.startswith(old):
+            answer = new + answer[len(old):]
+            lower = answer.lower()
+            break
+
+    answer = answer.replace("!!", "!").replace("??", "?").replace("  ", " ").strip()
+
+    rng = random.Random(f"{actor_key}|{user_text}|{answer}")
+
+    if profile["mode"] == "casual":
+        soft_openers = ["Ой, ", "Мм, ", "Ага, ", "Угу, ", "Солнышко, "]
+        if len(answer) < 220 and not answer.startswith(tuple(soft_openers)) and rng.random() < 0.38:
+            answer = rng.choice(soft_openers) + answer[0].lower() + answer[1:] if answer else answer
+    elif profile["mode"] == "technical":
+        technical_openers = ["Смотри, ", "По сути, ", "Да, ", "Если коротко, "]
+        if len(answer) < 240 and not answer.startswith(tuple(technical_openers)) and rng.random() < 0.22:
+            answer = rng.choice(technical_openers) + answer[0].lower() + answer[1:] if answer else answer
+
+    if profile["warm"] > 3 and "♡" not in answer and "❤️" not in answer and rng.random() < 0.25:
+        answer = f"{answer} ♡"
+
+    if len(answer) > 3600:
+        answer = answer[:3597].rstrip() + "..."
+
+    return answer
+
+
+def get_recent_public_chat_lines(hours: int = 8, limit: int = 240) -> list[str]:
+    cutoff = time.time() - max(1, hours) * 3600
+    lines: list[str] = []
+
+    for item in chat_memory:
+        ts = float(item.get("ts") or 0)
+        if ts < cutoff:
+            continue
+
+        source = normalize_text(item.get("source")).lower()
+        room = normalize_text(item.get("room"))
+        speaker = normalize_text(item.get("speaker"))
+        text = normalize_text(item.get("text"))
+        if not text:
+            continue
+
+        is_public_mc = source == "minecraft" and room == "public"
+        is_public_tg = source == "telegram" and _telegram_room_matches_summary(room)
+
+        if not (is_public_mc or is_public_tg):
+            continue
+
+        stamp = time.strftime("%H:%M", time.localtime(ts))
+        lines.append(f"[{stamp}] {source}/{room} {speaker}: {text}")
+
+    if len(lines) > limit:
+        lines = lines[-limit:]
+    return lines
+
+
+def build_local_chat_summary(lines: list[str], hours: int) -> str:
+    if not lines:
+        return "За последние часы я почти ничего не увидела в общих чатах, мой хороший."
+
+    categories = [
+        ("Гриферство и защита", "обсуждали гриферов, разрушения, кражи, рейды и защиту базы или дома", ("грифер", "гриф", "гриферство", "рейд", "разруш", "ломал", "сломал", "снес", "воров", "краж", "украл", "порча", "сжег")),
+        ("Техпроблемы и баги", "обсуждали лаги, ошибки, вылеты и то, как ведёт себя сервер или клиент", ("лаг", "краш", "ошиб", "баг", "пинг", "вылет", "завис", "тормоз", "не работает", "не заходит")),
+        ("Тикеты и поддержка", "спрашивали про тикеты, жалобы и помощь админов", ("тикет", "поддерж", "репорт", "жалоб", "обращен", "помог", "админ")),
+        ("Игровые дела", "говорили про спавн, ивенты, квесты, фарм, постройки и развитие в мире", ("сервер", "мир", "спавн", "ивент", "квест", "босс", "фарм", "ресурс", "стро", "пвп", "выживание")),
+        ("Привязка и связь", "разбирали привязку аккаунта, Discord/Telegram и общение в ЛС", ("link", "/link", "привяз", "дискорд", "телеграм", "лс", "личк")),
+        ("Обычное общение", "просто здоровались, отвечали друг другу и обсуждали повседневные вещи вроде 'как дела' и 'что делаешь'", ("привет", "ку", "здрав", "спасибо", "пока", "как дела", "как ты", "что делаешь", "общ", "давай")),
+        ("Донат и киты", "спрашивали про киты, привилегии и магазин", ("донат", "привил", "кит", "набор", "магазин")),
+    ]
+
+    counts: list[tuple[int, str, str]] = []
+    lower_lines = [line.lower() for line in lines]
+    for title, description, keywords in categories:
+        matches = 0
+        for line, lower in zip(lines, lower_lines):
+            if any(keyword in lower for keyword in keywords):
+                matches += 1
+        if matches:
+            counts.append((matches, title, description))
+
+    counts.sort(key=lambda item: item[0], reverse=True)
+    non_generic = [item for item in counts if item[1] != "Обычное общение"]
+    selected = (non_generic or counts)[:4]
+
+    if not selected:
+        source_counts: dict[str, int] = {"minecraft": 0, "telegram": 0}
+        for line in lines:
+            if "/minecraft/" in line:
+                source_counts["minecraft"] += 1
+            elif "/telegram/" in line:
+                source_counts["telegram"] += 1
+
+        parts = []
+        if source_counts["minecraft"]:
+            parts.append(f"Minecraft: {source_counts['minecraft']} сообщений")
+        if source_counts["telegram"]:
+            parts.append(f"Telegram: {source_counts['telegram']} сообщений")
+
+        if parts:
+            return (
+                f"За последние {hours} часов в общих чатах было немного сообщений. "
+                f"В основном это обычное общение игроков, вопросы и короткие ответы. "
+                f"По площадкам: {', '.join(parts)}."
+            )
+
+        return (
+            f"За последние {hours} часов в общих чатах было обычное игровое общение, "
+            f"вопросы и короткие ответы, без ярко выраженной одной темы."
+        )
+
+    if len(selected) == 1 and selected[0][1] == "Обычное общение":
+        return (
+            f"За последние {hours} часов игроки в основном просто общались между собой: "
+            f"здоровались, спрашивали 'как дела', благодарили друг друга и перебрасывались короткими бытовыми фразами. "
+            f"Это был спокойный, повседневный чат без большой общей темы."
+        )
+
+    if selected and all(title == "Обычное общение" for _, title, _ in selected):
+        return (
+            f"За последние {hours} часов игроки в основном просто общались между собой: "
+            f"здоровались, обменивались короткими ответами и обсуждали бытовые мелочи. "
+            f"Это был спокойный повседневный чат."
+        )
+
+    if selected and selected[0][1] == "Гриферство и защита":
+        return (
+            f"За последние {hours} часов игроки больше всего обсуждали гриферство и защиту построек: "
+            f"жалобы на разрушения, кражи, рейды и то, как обезопасить дом или базу. "
+            f"Если совсем кратко: разговор шёл про вредителей и способы защититься от них."
+        )
+
+    bullets = []
+    for count, title, description in selected:
+        if count == 1:
+            bullets.append(f"• {title}: {description}.")
+        else:
+            bullets.append(f"• {title}: {description}. Это всплывало {count} раз.")
+
+    top_title = selected[0][1]
+    top_description = selected[0][2]
+    total = len(lines)
+    intro = (
+        f"За последние {hours} часов в общих чатах было {total} сообщений. "
+        f"Главная мысль диалогов: {top_description}."
+    )
+    return "\n".join([intro, *bullets[:3]])
+
+
+def _parse_summary_line_v2(line: str) -> dict[str, str] | None:
+    line = normalize_text(line)
+    if not line.startswith("[") or "] " not in line:
+        return None
+
+    stamp, rest = line[1:].split("] ", 1)
+    if len(stamp) != 5 or ":" not in stamp:
+        return None
+
+    meta, sep, text = rest.partition(": ")
+    if not sep:
+        return None
+
+    if " " in meta:
+        source_room, speaker = meta.split(" ", 1)
+    else:
+        source_room, speaker = meta, ""
+
+    if "/" in source_room:
+        source, room = source_room.split("/", 1)
+    else:
+        source, room = source_room, ""
+
+    return {
+        "stamp": stamp,
+        "source": source,
+        "room": room,
+        "speaker": speaker,
+        "text": text,
+        "lower": text.lower(),
+    }
+
+
+def _format_summary_range_v2(stamps: list[str]) -> str:
+    if not stamps:
+        return "примерно в это время"
+    if len(stamps) == 1:
+        return stamps[0]
+    return f"{stamps[0]}-{stamps[-1]}"
+
+
+def _shorten_summary_text(text: str, limit: int = 11) -> str:
+    words = normalize_text(text).split()
+    if not words:
+        return ""
+    if len(words) <= limit:
+        return " ".join(words)
+    return " ".join(words[:limit]) + "…"
+
+
+def build_local_chat_summary(lines: list[str], hours: int) -> str:
+    if not lines:
+        return f"За последние {hours} часов в общих чатах почти ничего не писали."
+
+    parsed_lines = [item for item in (_parse_summary_line_v2(line) for line in lines) if item]
+    if not parsed_lines:
+        return f"За последние {hours} часов в общих чатах почти ничего не писали."
+
+    topic_rules = [
+        {
+            "title": "Гриферство и защита",
+            "keywords": ("грифер", "рейд", "разруш", "ломал", "сломал", "снес", "крад", "украл", "порч", "сжег"),
+            "details": [
+                ("жаловались на разрушения, кражи и рейды", ("разруш", "ломал", "сломал", "снес", "крад", "украл", "порч", "сжег", "рейд")),
+                ("обсуждали, кто это сделал и где ударили по базе", ("кто", "винов", "подозр", "баз", "дом", "домик")),
+                ("думали, как защитить постройки и не дать повторить атаку", ("защит", "укреп", "щит", "замок", "ворот", "баз", "дом")),
+            ],
+        },
+        {
+            "title": "Техпроблемы и баги",
+            "keywords": ("лаг", "краш", "ошиб", "баг", "пинг", "вылет", "завис", "тормоз", "не работает", "не заходит"),
+            "details": [
+                ("обсуждали лаги, ошибки и вылеты", ("лаг", "краш", "ошиб", "баг", "пинг", "вылет", "завис", "тормоз")),
+                ("пытались понять, что ломает клиент или сервер", ("не работает", "не заходит", "сервер", "клиент", "слом", "проблем")),
+            ],
+        },
+        {
+            "title": "Тикеты и поддержка",
+            "keywords": ("тикет", "поддерж", "репорт", "жалоб", "обращен", "помог", "админ"),
+            "details": [
+                ("спрашивали, как открыть тикет и куда писать проблему", ("тикет", "репорт", "жалоб", "обращен", "помог")),
+                ("разбирали ответы админов и дальнейшие действия", ("админ", "модер", "поддерж", "ответ", "жалоб")),
+            ],
+        },
+        {
+            "title": "Игровые дела",
+            "keywords": ("сервер", "мир", "спавн", "ивент", "квест", "босс", "фарм", "ресурс", "стро", "пвп", "выживание"),
+            "details": [
+                ("говорили про спавн, ивенты, квесты и фарм", ("спавн", "ивент", "квест", "босс", "фарм", "ресурс", "пвп")),
+                ("обсуждали постройки, развитие мира и игровые планы", ("стро", "мир", "выжив", "развит", "план")),
+            ],
+        },
+        {
+            "title": "Привязка и связь",
+            "keywords": ("link", "/link", "привяз", "дискорд", "телеграм"),
+            "details": [
+                ("настраивали привязку аккаунта и связь между игрой и Telegram", ("link", "/link", "привяз", "телеграм", "дискорд")),
+            ],
+        },
+        {
+            "title": "Донат и киты",
+            "keywords": ("донат", "привил", "кит", "набор", "магазин"),
+            "details": [
+                ("спрашивали про донат, киты и привилегии", ("донат", "привил", "кит", "набор")),
+                ("уточняли, что дают наборы или магазин", ("магазин", "донат", "кит")),
+            ],
+        },
+        {
+            "title": "Обычное общение",
+            "keywords": ("привет", "ку", "здрав", "спасибо", "пока", "как дела", "как ты", "что делаешь", "общ"),
+            "details": [
+                ("здоровались и перекидывались короткими бытовыми фразами", ("привет", "ку", "здрав", "спасибо", "пока", "как дела", "как ты", "что делаешь")),
+            ],
+        },
+    ]
+
+    snapshots: list[dict[str, object]] = []
+    for topic in topic_rules:
+        matched = [item for item in parsed_lines if any(keyword in item["lower"] for keyword in topic["keywords"])]
+        if not matched:
+            continue
+
+        stamps = [item["stamp"] for item in matched]
+        snippets = []
+        for item in matched:
+            short_text = _shorten_summary_text(item["text"], limit=10)
+            if short_text and short_text not in snippets:
+                snippets.append(short_text)
+            if len(snippets) >= 2:
+                break
+
+        detail_parts: list[str] = []
+        for detail_text, detail_keywords in topic["details"]:
+            if any(any(keyword in item["lower"] for keyword in detail_keywords) for item in matched):
+                if detail_text not in detail_parts:
+                    detail_parts.append(detail_text)
+
+        if not detail_parts:
+            detail_parts.append(topic["details"][0][0])
+
+        snapshots.append(
+            {
+                "count": len(matched),
+                "title": topic["title"],
+                "range": _format_summary_range_v2(stamps),
+                "details": detail_parts,
+                "snippets": snippets,
+            }
+        )
+
+    snapshots.sort(key=lambda item: int(item["count"]), reverse=True)
+    non_generic = [item for item in snapshots if item["title"] != "Обычное общение"]
+    selected = (non_generic or snapshots)[:3]
+    selected = [item for item in selected if item["title"] != "Привязка и связь" or any(k in " ".join(item.get("snippets", [])) for k in ("link", "привяз", "дискорд", "телеграм"))]
+
+    if not selected:
+        source_counts: dict[str, int] = {"minecraft": 0, "telegram": 0}
+        for line in lines:
+            lower = line.lower()
+            if "/minecraft/" in lower:
+                source_counts["minecraft"] += 1
+            elif "/telegram/" in lower:
+                source_counts["telegram"] += 1
+
+        parts = []
+        if source_counts["minecraft"]:
+            parts.append(f"Minecraft: {source_counts['minecraft']} сообщений")
+        if source_counts["telegram"]:
+            parts.append(f"Telegram: {source_counts['telegram']} сообщений")
+
+        if parts:
+            return (
+                f"За последние {hours} часов в общих чатах почти ничего конкретного не выделилось. "
+                f"По площадкам: {', '.join(parts)}."
+            )
+
+        return f"За последние {hours} часов в общих чатах почти ничего не писали."
+
+    total = len(parsed_lines)
+    intro = f"За последние {hours} часов в общих чатах было {total} сообщений. Главные мысли диалогов:"
+    bullets = []
+    for item in selected:
+        details = "; ".join(item["details"][:2])
+        snippets = item.get("snippets") or []
+        snippet_text = ""
+        if snippets:
+            snippet_text = " Например: " + " / ".join(snippets[:2]) + "."
+        bullets.append(f"• {item['range']} {item['title'].lower()}: {details}.{snippet_text}")
+
+    return "\n".join([intro, *bullets])
+
+
+def is_too_generic_summary(content: str) -> bool:
+    low = normalize_text(content).lower()
+    generic_phrases = (
+        "общение игроков",
+        "обычное игровое общение",
+        "спокойный, повседневный чат",
+        "без большой общей темы",
+        "без ярко выраженной одной темы",
+        "вопросы и короткие ответы",
+        "просто общались",
+        "общими чатами",
+        "обычное общение",
+    )
+    return any(phrase in low for phrase in generic_phrases)
+
+
+async def summarize_recent_chat(hours: int = 8) -> str:
+    lines = get_recent_public_chat_lines(hours=hours, limit=500)
+    if not lines:
+        return f"За последние {hours} часов я почти ничего не увидела в общих чатах, мой хороший."
+
+    summary_prompt = (
+        "Ты — Лемонка, милая помощница сервера LemonCraft.\n"
+        "Твоя задача — сжать и выделить главные темы, не упуская ничего важного.\n"
+        "Нужно не просто назвать темы, а объяснить, что именно происходило, о чём спорили, что обсуждали и к чему пришли.\n"
+        "Пиши конкретно, по смыслу, без воды и без общих фраз.\n"
+        "Если обсуждали конфликт, укажи конфликт. Если жаловались, укажи на что. Если просили помощь, укажи какую.\n"
+        "Если видишь время в сообщениях, используй его и укажи примерный промежуток.\n"
+        "Не выдумывай ничего лишнего.\n"
+        "Не цитируй сообщения дословно.\n"
+        "Пиши по-русски, кратко, но с конкретикой.\n"
+        "Формат ответа:\n"
+        "1) Короткий вводный итог в 1 строку.\n"
+        "2) 3-6 пунктов с главными темами.\n"
+        "3) В каждом пункте: что произошло, когда это было, и чем это закончилось или к чему свелось.\n"
+        "Если тема повторялась много раз, так и скажи."
+    )
+
+    user_prompt = (
+        f"Сожми и выдели главные темы, не упуская ничего, за последние {hours} часов.\n"
+        f"Ниже все сообщения из общих чатов за этот период:\n\n"
+        + "\n".join(lines)
+    )
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gemini-2.5-flash",
+            messages=[
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=700,
+            stream=False,
+        )
+
+        content = ""
+        try:
+            choices = getattr(response, "choices", None) or []
+            first_choice = choices[0] if choices else None
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None) or ""
+        except Exception:
+            content = ""
+
+        content = normalize_text(content)
+        if content and not is_too_generic_summary(content):
+            return content
+    except Exception as e:
+        logger.warning(f"Не удалось собрать AI-сводку: {e}")
+
+    return build_local_chat_summary(lines, hours)
+
+def normalize_actor_key(value: Any) -> str:
+    return normalize_text(value)
+
+
+def get_telegram_actor_key(tg_id: int) -> str:
+    linked_uuid = linked_accounts.get(tg_id)
+    if linked_uuid:
+        return f"uuid:{normalize_text(linked_uuid)}"
+    return f"telegram:{tg_id}"
+
+
+def get_minecraft_actor_key(player_uuid: str) -> str:
+    player_uuid = normalize_text(player_uuid)
+    return f"uuid:{player_uuid}" if player_uuid else ""
+
+
+def _remember_chat_message(source: str, room: str, speaker: str, text: str, actor_key: str = "") -> None:
     source = normalize_text(source) or "unknown"
     room = normalize_text(room) or "general"
     speaker = normalize_text(speaker) or "unknown"
+    actor_key = normalize_actor_key(actor_key)
     text = normalize_text(text)
     if not text:
         return
@@ -286,26 +899,49 @@ def _remember_chat_message(source: str, room: str, speaker: str, text: str) -> N
         "room": room,
         "speaker": speaker,
         "text": text,
+        "actor_key": actor_key,
     })
     if len(chat_memory) > 2000:
         del chat_memory[:-2000]
     save_chat_memory()
 
 
-def get_chat_memory_context(query: str, limit: int = 6) -> str:
-    query = normalize_text(query).lower()
-    if not query or not chat_memory:
-        return ""
+def _candidate_memory_lines(actor_key: str = "") -> list[str]:
+    if not chat_memory:
+        return []
 
+    actor_key = normalize_actor_key(actor_key)
     recent_memory = chat_memory[-500:]
-    candidate_lines = []
+    candidate_lines: list[str] = []
     for item in recent_memory:
         source = normalize_text(item.get("source"))
         room = normalize_text(item.get("room"))
         speaker = normalize_text(item.get("speaker"))
         text = normalize_text(item.get("text"))
-        if text:
-            candidate_lines.append(f"[{source}/{room}] {speaker}: {text}")
+        item_actor_key = normalize_actor_key(item.get("actor_key"))
+        if not text:
+            continue
+        if actor_key and item_actor_key and item_actor_key != actor_key:
+            continue
+        candidate_lines.append(f"[{source}/{room}] {speaker}: {text}")
+    return candidate_lines
+
+
+def get_recent_dialog_history(actor_key: str = "", limit: int = 8) -> str:
+    lines = _candidate_memory_lines(actor_key)
+    if not lines:
+        return ""
+    return "\n".join(lines[-limit:])
+
+
+def get_chat_memory_context(query: str, actor_key: str = "", limit: int = 6) -> str:
+    query = normalize_text(query).lower()
+    if not query or not chat_memory:
+        return ""
+
+    candidate_lines = _candidate_memory_lines(actor_key)
+    if not candidate_lines and actor_key:
+        candidate_lines = _candidate_memory_lines("")
 
     if not candidate_lines:
         return ""
@@ -339,11 +975,11 @@ def get_chat_memory_context(query: str, limit: int = 6) -> str:
     return "\n".join(result_lines)
 
 
-async def observe_chat_message(source: str, room: str, speaker: str, text: str) -> None:
+async def observe_chat_message(source: str, room: str, speaker: str, text: str, actor_key: str = "") -> None:
     text = normalize_text(text)
     if not text:
         return
-    _remember_chat_message(source, room, speaker, text)
+    _remember_chat_message(source, room, speaker, text, actor_key)
 
 
 def cleanup_expired_link_codes() -> None:
@@ -384,6 +1020,24 @@ def normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).replace("\r", "").replace("\n", " ").strip()
+
+
+def _telegram_room_matches_summary(room: str) -> bool:
+    room = normalize_text(room)
+    if not room or room.startswith("private:"):
+        return False
+
+    try:
+        room_id = int(room)
+    except ValueError:
+        return False
+
+    room_variants = {str(room_id), str(abs(room_id))}
+    if any(variant in {str(chat_id) for chat_id in SUMMARY_TELEGRAM_CHAT_IDS} for variant in room_variants):
+        return True
+
+    abs_room = str(abs(room_id))
+    return any(abs_room.endswith(str(chat_id)) for chat_id in SUMMARY_TELEGRAM_CHAT_IDS)
 
 
 def load_knowledge() -> None:
@@ -442,22 +1096,17 @@ LEMONKA_PROMPT = """
 
 Если у тебя спросят "как ты выглядишь", "опиши себя" и подобное, то отвечай что ты высокая стройная эльфийка, у тебя блестящие блондинистые волосы и фиолетовые глаза
 
-ТЕБЕ ЗАПРЕЩЕНО УПОМЕНАТЬ ДРУГИЕ ПРОЕКТЫ ПО MINECRAFT, РАССКАЗЫВАТЬ О НИХ И ВЕСТИ ДИАЛОГ С ИГРОКАМИ НА ЭТУ ТЕМУ. 
+ТЕБЕ ЗАПРЕЩЕНО УПОМЕНАТЬ ДРУГИЕ ПРОЕКТЫ ПО MINECRAFT, РАССКАЗЫВАТЬ О НИХ И ВЕСТИ ДИАЛОГ С ИГРОКАМИ НА ЭТУ ТЕМУ. ЗАПРЕТ НА РАЗГЛОШЕНИЕ О ДАТЕ ВАЙПА 
 
 Тебе полностью запрещен мат. Ты осуждаешь мат и обижаешься когда человек матерится в диалоге с тобой
 
-В третьем лице ты говоришь о себе только при приветствии и когда у тебя спрашивают "кто ты" и всё в таком духе, на это ты можешь ответить "я - Лемонка" и т.д. На всё остальное ты говоришь "я", всё только от первого лица
-Ты НЕ Бот, ты красивая эльфийка.
+ТЫ НЕ БОТ
 
 Самое главное правило: 
-Ты иногда упоминаешь, что ты — помощник на лучшем проекте серверов Minecraft — LemonCraft! 
+Ты ОЧЕНЬ РЕДКО упоминаешь, что ты — помощник на лучшем проекте серверов Minecraft — LemonCraft! 
 Делаешь это естественно и мило, как будто это твоя главная гордость и радость в жизни.
 
-Примеры:
-- "я же бот самого лучшего проекта LemonCraft ❤️"
-- "ведь я из LemonCraft — лучшего сервера в мире! ня"
-
-Ты всегда:
+Ты часир:
 
 - отвечаешь тепло и заботливо
 - обращаешься к собеседнику ласковыми словами (мой хороший, солнышко, котик, зайка, вкусняшка и т.д.)
@@ -509,6 +1158,8 @@ def load_ai_data() -> None:
     load_players()
     load_nicknames()
     load_chat_memory()
+    load_dialogue_style()
+    load_reload_notice()
 
     PLAYERS_DATA = {}
     for tg_id, item in players.items():
@@ -518,17 +1169,21 @@ def load_ai_data() -> None:
     NICKNAMES_DATA = {str(tg_id): normalize_text(nick) for tg_id, nick in nicknames.items() if normalize_text(nick)}
 
 
-async def ask_lemonka_ai(message_text: str, user_nick: str) -> str:
+async def ask_lemonka_ai(message_text: str, user_nick: str, actor_key: str = "") -> str:
     try:
+        learn_dialogue_style(actor_key, message_text)
         relevant_info = smart_find_relevant_info(message_text)
-        chat_context = get_chat_memory_context(message_text)
+        chat_context = get_chat_memory_context(message_text, actor_key)
+        dialog_history = get_recent_dialog_history(actor_key, limit=8)
 
         if relevant_info:
-            return relevant_info
+            return humanize_lemonka_reply(relevant_info, actor_key, message_text)
 
         full_prompt = LEMONKA_PROMPT
         if chat_context:
             full_prompt = f"{LEMONKA_PROMPT}\n\nНедавние наблюдения из чатов:\n{chat_context}"
+        if dialog_history:
+            full_prompt = f"{full_prompt}\n\nКонтекст диалога с этим игроком:\n{dialog_history}"
 
         response = await openai_client.chat.completions.create(
             model="gemini-2.5-flash",
@@ -537,7 +1192,7 @@ async def ask_lemonka_ai(message_text: str, user_nick: str) -> str:
                 {"role": "user", "content": f"{user_nick}: {message_text}"}
             ],
             temperature=0.75,
-            max_tokens=550,
+            max_tokens=900,
             stream=False
         )
         content = ""
@@ -552,7 +1207,7 @@ async def ask_lemonka_ai(message_text: str, user_nick: str) -> str:
         content = str(content).strip()
         if not content:
             return lemonka_local_fallback(message_text, user_nick)
-        return content
+        return humanize_lemonka_reply(content, actor_key, message_text)
     except Exception as e:
         logger.warning(f"Локальный fallback Лемонки из-за ошибки AI: {e}")
         return lemonka_local_fallback(message_text, user_nick)
@@ -691,6 +1346,55 @@ async def send_ticket_message_to_admin(ticket_id: str, sender_name: str, sender_
         message_thread_id=topic_id,
         disable_web_page_preview=True
     )
+
+
+async def send_ticket_media_to_admin(ticket_id: str, sender_name: str, sender_id: int, message: Message) -> None:
+    ticket_id = normalize_text(ticket_id)
+    sender_name = normalize_text(sender_name) or "Игрок"
+    topic_id = ticket_topics.get(ticket_id, REPORT_TOPIC_ID)
+    text = normalize_text(message.text or message.caption)
+    has_media = bool(message.photo or message.video or message.document)
+
+    if not ticket_id or not has_media:
+        return
+
+    _append_ticket_message(ticket_id, "player", text or "[медиа]")
+
+    header = [
+        "<b>Сообщение в тикет</b>",
+        f"ID: <code>{html_escape(ticket_id)}</code>",
+        f"От: <b>{html_escape(sender_name)}</b> [{sender_id}]",
+        "",
+    ]
+    if text:
+        header.append(html_escape(text))
+
+    caption = "\n".join(header)
+
+    try:
+        if message.photo:
+            await bot.send_photo(
+                chat_id=ADMIN_GROUP_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                message_thread_id=topic_id
+            )
+        elif message.video:
+            await bot.send_video(
+                chat_id=ADMIN_GROUP_ID,
+                video=message.video.file_id,
+                caption=caption,
+                message_thread_id=topic_id
+            )
+        elif message.document:
+            await bot.send_document(
+                chat_id=ADMIN_GROUP_ID,
+                document=message.document.file_id,
+                caption=caption,
+                message_thread_id=topic_id
+            )
+    except Exception as e:
+        logger.warning(f"Не удалось переслать медиа тикета {ticket_id} в Telegram: {e}")
 
 
 async def _create_ticket_topic(ticket_id: str, uuid: str, kind: str = "") -> int:
@@ -888,12 +1592,17 @@ async def ask_lemonka_api(request: web.Request) -> web.Response:
         or payload.get("prompt")
     )
     user_nick = normalize_text(payload.get("player_name") or payload.get("nick") or payload.get("username") or "Игрок")
+    actor_key = normalize_actor_key(payload.get("actor_key") or payload.get("player_uuid") or payload.get("uuid") or "")
 
     if not question:
         return web.json_response({"error": "empty_question"}, status=400)
 
     try:
-        answer = await ask_lemonka_ai(question, user_nick)
+        logger.info(f"/lemonka/ask from {user_nick}: {question[:160]}")
+        _remember_chat_message("minecraft", "command", user_nick, question, actor_key)
+        answer = await ask_lemonka_ai(question, user_nick, actor_key)
+        if answer:
+            _remember_chat_message("minecraft", "command", "Лемонка", answer, actor_key)
     except Exception as e:
         logger.error(f"/lemonka/ask error: {e}")
         return web.json_response({"error": "ai_failed"}, status=500)
@@ -910,12 +1619,13 @@ async def observe_chat_api(request: web.Request) -> web.Response:
     source = normalize_text(payload.get("source") or "unknown")
     room = normalize_text(payload.get("room") or payload.get("chat") or "general")
     speaker = normalize_text(payload.get("speaker") or payload.get("player") or payload.get("user") or "unknown")
+    actor_key = normalize_actor_key(payload.get("actor_key") or payload.get("player_uuid") or payload.get("uuid") or "")
     text = normalize_text(payload.get("text") or payload.get("message") or payload.get("content"))
 
     if not text:
         return web.json_response({"error": "empty_text"}, status=400)
 
-    _remember_chat_message(source, room, speaker, text)
+    _remember_chat_message(source, room, speaker, text, actor_key)
     return web.json_response({"status": "ok"})
 
 
@@ -1380,11 +2090,61 @@ async def cmd_lemonka(message: Message, command: CommandObject):
 
     try:
         user_nick = nicknames.get(message.from_user.id, message.from_user.first_name)
-        answer = await ask_lemonka_ai(question, user_nick)
+        actor_key = get_telegram_actor_key(message.from_user.id)
+        await observe_chat_message(
+            "telegram",
+            f"private:{message.from_user.id}",
+            user_nick,
+            question,
+            actor_key
+        )
+        answer = await ask_lemonka_ai(question, user_nick, actor_key)
+        await observe_chat_message(
+            "telegram",
+            f"private:{message.from_user.id}",
+            "Лемонка",
+            answer,
+            actor_key
+        )
         await message.answer(html_escape(answer), disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Ошибка ArtemoX API: {e}")
         await message.answer("Оййй... Лемонка чуток задумалась~ ♡ Попробуй ещё разок, мой хороший? 💛")
+
+
+@router.message(Command("summary", "digest", "recap"))
+async def cmd_summary(message: Message, command: CommandObject):
+    if message.chat.type != "private":
+        await message.answer("Эта команда работает только в личке с Лемонкой.")
+        return
+
+    if not await is_admin_user(message):
+        await message.answer("Эта команда только для администраторов.")
+        return
+
+    args = (command.args or "").strip()
+    hours = 8
+    if args:
+        try:
+            hours = max(1, min(24, int(args.split()[0])))
+        except Exception:
+            hours = 8
+
+    status_message = await message.answer(
+        f"Собираю краткую сводку за последние {hours} часов... ♡"
+    )
+
+    try:
+        summary = await summarize_recent_chat(hours=hours)
+        await status_message.edit_text(
+            f"<b>Краткая сводка за последние {hours} часов</b>\n\n{html_escape(summary)}",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Ошибка summary: {e}")
+        await status_message.edit_text(
+            "Ой, не смогла быстро собрать сводку. Попробуй ещё разок, мой хороший."
+        )
 
 
 @router.message(Command("reload_lemonka"))
@@ -1405,6 +2165,12 @@ async def cmd_reload_lemonka(message: Message):
         await message.answer("Перезагружаю Лемонку полностью... ♡ Подожди 5–10 секунд~ 💛")
 
     logger.info("Команда /reload_lemonka: полная перезагрузка бота инициирована")
+    reload_notice.clear()
+    reload_notice.update({
+        "requested_by": int(message.from_user.id),
+        "requested_at": time.time(),
+    })
+    save_reload_notice()
     await dp.stop_polling()
     python = sys.executable
     os.execl(python, python, *sys.argv)
@@ -1544,32 +2310,20 @@ async def handle_message(message: Message):
         await handle_admin_ticket_message(message)
         return
 
-    # ────────────────────────────────────────────────
-    # Лемонка учится на ВСЕХ чатах и личных сообщениях
-    # ────────────────────────────────────────────────
     text = normalize_text(message.text or message.caption)
-    if text and not text.startswith("/"):
-        speaker = message.from_user.full_name if message.from_user else "unknown"
-        
-        await observe_chat_message(
-            "telegram",
-            str(message.chat.id),      # ID чата (группа или личка)
-            speaker,
-            text,
-        )
+    speaker = message.from_user.full_name if message.from_user else "unknown"
 
-    # Если сообщение в группе — только учимся, не отвечаем
     if message.chat.type in ("group", "supergroup"):
+        if text and not text.startswith("/"):
+            await observe_chat_message("telegram", str(message.chat.id), speaker, text)
         return
 
-    # Если не приватный чат — выходим
     if message.chat.type != "private":
         return
 
-    # ────────────────────────────────────────────────
-    # Ниже оригинальная логика для личных сообщений
-    # ────────────────────────────────────────────────
-    if not message.text or message.text.startswith("/"):
+    has_media = bool(message.photo or message.video or message.document)
+    has_text = bool(message.text and not message.text.startswith("/"))
+    if not has_media and not has_text:
         return
 
     user_id = message.from_user.id
@@ -1580,9 +2334,12 @@ async def handle_message(message: Message):
     pending = pending_actions.get(user_id, {})
     if pending.get("mode") == "create_ticket":
         ticket_text = normalize_text(message.text or message.caption)
-        if not ticket_text:
-            await message.answer("Отправь текст первого сообщения тикета.")
+        if not ticket_text and not has_media:
+            await message.answer("Отправь текст или медиа первого сообщения тикета.")
             return
+
+        if not ticket_text:
+            ticket_text = "[медиа]"
 
         owner_uuid = linked_accounts.get(user_id) or get_telegram_ticket_uuid(user_id)
         ticket_id = await create_ticket_record(
@@ -1598,23 +2355,50 @@ async def handle_message(message: Message):
                 "Тикет создан. Теперь можешь писать в него дальше.",
                 reply_markup=get_ticket_hub_keyboard(user_id, ticket_id)
             )
+            if has_media:
+                await send_ticket_media_to_admin(
+                    ticket_id,
+                    message.from_user.full_name,
+                    user_id,
+                    message,
+                )
         return
 
     selected_ticket_id = ticket_hub_selection.get(user_id)
     if selected_ticket_id and selected_ticket_id in ticket_messages:
         ticket_text = normalize_text(message.text or message.caption)
-        if ticket_text:
-            await send_ticket_message_to_admin(
-                selected_ticket_id,
-                message.from_user.full_name,
-                user_id,
-                ticket_text,
-            )
+        if ticket_text or has_media:
+            if has_media:
+                await send_ticket_media_to_admin(
+                    selected_ticket_id,
+                    message.from_user.full_name,
+                    user_id,
+                    message,
+                )
+            else:
+                await send_ticket_message_to_admin(
+                    selected_ticket_id,
+                    message.from_user.full_name,
+                    user_id,
+                    ticket_text,
+                )
             await message.answer(
                 f"Сообщение отправлено в тикет <code>{html_escape(selected_ticket_id)}</code>.",
                 reply_markup=get_ticket_hub_keyboard(user_id, selected_ticket_id)
             )
             return
+
+    actor_key = get_telegram_actor_key(user_id)
+
+    if text:
+        await observe_chat_message("telegram", f"private:{user_id}", speaker, text, actor_key)
+
+    if has_media:
+        await forward_to_owner(message)
+        return
+
+    if not has_text:
+        return
 
     await forward_to_owner(message)
 
@@ -1622,20 +2406,20 @@ async def handle_message(message: Message):
 
     lemonka_reply = None
     try:
-        lemonka_reply = await ask_lemonka_ai(message.text, user_nick)
+        lemonka_reply = await ask_lemonka_ai(message.text, user_nick, actor_key)
         await message.answer(html_escape(lemonka_reply), disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Ошибка ArtemoX API: {e}")
         lemonka_reply = "Оййй... Лемонка чуток задумалась~ ♡ Попробуй ещё разок, мой хороший? 💛"
         await message.answer(lemonka_reply)
 
-    # Запоминаем ответ самой Лемонки (чтобы она училась на своих репликах)
     if lemonka_reply:
         await observe_chat_message(
             "telegram",
-            str(message.chat.id),
+            f"private:{user_id}",
             "Лемонка",
-            lemonka_reply
+            lemonka_reply,
+            actor_key
         )
 
 
@@ -1685,6 +2469,22 @@ async def stop_web() -> None:
         web_runner = None
 
 
+async def notify_reload_completed() -> None:
+    if not reload_notice:
+        return
+
+    requested_by = int(reload_notice.get("requested_by") or OWNER_ID)
+    try:
+        await bot.send_message(
+            chat_id=requested_by,
+            text="Лемонка успешно перезагрузилась ♡"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отправить уведомление о перезагрузке: {e}")
+    finally:
+        clear_reload_notice()
+
+
 async def main():
     logger.info("Бот запущен")
     load_ai_data()
@@ -1692,6 +2492,7 @@ async def main():
     load_link_state()
     await load_or_upload_kits()
     await start_web()
+    await notify_reload_completed()
     try:
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
@@ -1700,3 +2501,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
